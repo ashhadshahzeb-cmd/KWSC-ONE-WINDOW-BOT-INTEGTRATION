@@ -79,7 +79,7 @@ const CACHE_KEY = "kwsc_dashboard_real_data_v2";
 export default function Dashboard() {
   const [records, setRecords] = useState<DashboardRecord[]>(() => {
     try {
-      const cached = localStorage.getItem(CACHE_KEY);
+      const cached = sessionStorage.getItem(CACHE_KEY) || localStorage.getItem(CACHE_KEY);
       if (cached) {
         const parsed = JSON.parse(cached);
         if (Array.isArray(parsed) && parsed.length > 0) return parsed;
@@ -88,7 +88,9 @@ export default function Dashboard() {
     return [];
   });
 
+  const [recentFiles, setRecentFiles] = useState<DashboardRecord[]>([]);
   const [isLoading, setIsLoading] = useState<boolean>(records.length === 0);
+  const [isDrilldownLoading, setIsDrilldownLoading] = useState<boolean>(false);
   const [syncProgress, setSyncProgress] = useState<string>("");
   const [timeRange, setTimeRange] = useState<"all" | "today" | "30d" | "this_month" | "this_year">("all");
   const [selectedCategoryFilter, setSelectedCategoryFilter] = useState<string>("all");
@@ -103,9 +105,46 @@ export default function Dashboard() {
     items: DashboardRecord[];
   } | null>(null);
 
-  // Fetch full dataset on mount or refresh
+  // Fetch full dataset on mount or refresh + setup Realtime listener
   useEffect(() => {
     loadFullRealDataset();
+
+    // Setup Supabase Realtime channel for live updates without page refresh
+    const channel = supabase
+      .channel("dashboard_file_tracking_realtime")
+      .on(
+        "postgres_changes",
+        {
+          event: "*",
+          schema: "public",
+          table: "file_tracking_records"
+        },
+        (payload) => {
+          if (payload.eventType === "INSERT") {
+            const newRec = payload.new as DashboardRecord;
+            setRecords(prev => {
+              if (prev.some(r => r.id === newRec.id)) return prev;
+              return [newRec, ...prev];
+            });
+            setRecentFiles(prev => [newRec, ...prev.slice(0, 9)]);
+          } else if (payload.eventType === "UPDATE") {
+            const updatedRec = payload.new as DashboardRecord;
+            setRecords(prev => prev.map(r => r.id === updatedRec.id ? { ...r, ...updatedRec } : r));
+            setRecentFiles(prev => prev.map(r => r.id === updatedRec.id ? { ...r, ...updatedRec } : r));
+          } else if (payload.eventType === "DELETE") {
+            const deletedId = (payload.old as any)?.id;
+            if (deletedId) {
+              setRecords(prev => prev.filter(r => r.id !== deletedId));
+              setRecentFiles(prev => prev.filter(r => r.id !== deletedId));
+            }
+          }
+        }
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
   }, []);
 
   const loadFullRealDataset = async () => {
@@ -113,14 +152,14 @@ export default function Dashboard() {
     setSyncProgress("Connecting to File Tracking database...");
     try {
       // 1. Fetch exact count from Supabase
-      const { count, error: countErr } = await (supabase
+      const { count } = await (supabase
         .from("file_tracking_records" as any)
         .select("*", { count: "exact", head: true }));
 
-      const totalCount = count || 12397;
+      const totalCount = (count !== null && count !== undefined && count > 0) ? count : 12569;
       setSyncProgress(`Loading ${totalCount.toLocaleString()} official records...`);
 
-      // 2. Fetch in parallel chunks of 1000 to overcome PostgREST default limit
+      // 2. Fetch in parallel chunks of 1000 - select ONLY slim columns needed for aggregates (no huge strings)
       const chunkSize = 1000;
       const promises: Promise<DashboardRecord[]>[] = [];
 
@@ -128,13 +167,29 @@ export default function Dashboard() {
         promises.push(
           (supabase
             .from("file_tracking_records" as any)
-            .select("id, cfo_diary_number, receiving_number, inward_date, outward_date, main_category, sub_category, mark_to, amount, subject, created_at")
+            .select("id, main_category, sub_category, mark_to, inward_date, outward_date, amount, created_at")
             .range(i, i + chunkSize - 1) as any)
             .then((res: any) => res.data || [])
         );
       }
 
-      const chunkResults = await Promise.all(promises);
+      // Fast targeted query for the 10 newest files (takes <50ms)
+      const recentPromise = (supabase
+        .from("file_tracking_records" as any)
+        .select("id, cfo_diary_number, receiving_number, inward_date, outward_date, main_category, mark_to, amount, subject, created_at")
+        .order("created_at", { ascending: false })
+        .limit(10) as any)
+        .then((res: any) => res.data || []);
+
+      const [chunkResults, latestRecent] = await Promise.all([
+        Promise.all(promises),
+        recentPromise
+      ]);
+
+      if (latestRecent && latestRecent.length > 0) {
+        setRecentFiles(latestRecent);
+      }
+
       let allRemoteRecords = chunkResults.flat();
 
       // 3. Merge unsynced dirty records from Dexie IndexedDB
@@ -153,8 +208,8 @@ export default function Dashboard() {
       if (allRemoteRecords.length > 0) {
         setRecords(allRemoteRecords);
         try {
-          // Cache in localStorage for 0ms instant reload
-          localStorage.setItem(CACHE_KEY, JSON.stringify(allRemoteRecords.slice(0, 15000)));
+          // Cache in sessionStorage for ultra-fast tab switches without freezing localStorage
+          sessionStorage.setItem(CACHE_KEY, JSON.stringify(allRemoteRecords.slice(0, 3000)));
         } catch (storageErr) {
           console.warn("Storage quota note:", storageErr);
         }
@@ -219,17 +274,13 @@ export default function Dashboard() {
     filteredRecords.forEach(r => {
       inwardCount++;
 
-      // Outward file logic in File Tracking:
-      // File has been exited or forwarded out to an external department with distinct outward date
-      const isExited = r.mark_to === "exited";
-      const isDistinctOutward = Boolean(
-        r.outward_date &&
-        r.outward_date.trim() !== "" &&
-        r.inward_date &&
-        r.outward_date !== r.inward_date
+      // Real Outward logic: Any file that has an outward_date recorded or mark_to === 'exited'
+      const isOutward = Boolean(
+        (r.outward_date && r.outward_date.trim() !== "") ||
+        r.mark_to === "exited"
       );
 
-      if (isExited || isDistinctOutward) {
+      if (isOutward) {
         outwardCount++;
       }
 
@@ -242,14 +293,14 @@ export default function Dashboard() {
       }
     });
 
-    const inTransitCount = Math.max(0, inwardCount - outwardCount);
+    const pendingOutwardCount = Math.max(0, inwardCount - outwardCount);
     const outwardRate = inwardCount > 0 ? ((outwardCount / inwardCount) * 100).toFixed(1) : "0.0";
 
     return {
       totalFiles: filteredRecords.length,
       inwardCount,
       outwardCount,
-      inTransitCount,
+      pendingOutwardCount,
       outwardRate,
       totalAmount,
       activeSectionsCount: activeSections.size
@@ -340,7 +391,11 @@ export default function Dashboard() {
       const amt = Number(r.amount);
       if (!isNaN(amt) && amt > 0) map[secName].totalAmount += amt;
 
-      if (r.mark_to === "exited" || (r.outward_date && r.inward_date && r.outward_date !== r.inward_date)) {
+      const isOutward = Boolean(
+        (r.outward_date && r.outward_date.trim() !== "") ||
+        r.mark_to === "exited"
+      );
+      if (isOutward) {
         map[secName].outwardCount += 1;
       }
     });
@@ -361,28 +416,51 @@ export default function Dashboard() {
     const monthMap: Record<string, { month: string; sortKey: string; inward: number; outward: number; totalAmount: number }> = {};
 
     filteredRecords.forEach(r => {
-      const dateStr = r.inward_date || r.created_at;
-      if (!dateStr) return;
-      const d = new Date(dateStr);
-      if (isNaN(d.getTime())) return;
+      // 1. Inward counted on inward_date
+      const inDateStr = r.inward_date || r.created_at;
+      if (inDateStr) {
+        const d = new Date(inDateStr);
+        if (!isNaN(d.getTime())) {
+          const year = d.getFullYear();
+          if (year >= 2024 && year <= 2027) {
+            const sortKey = `${year}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+            const monthLabel = d.toLocaleDateString("en-US", { month: "short", year: "2-digit" });
 
-      const year = d.getFullYear();
-      // Filter out invalid historical dates outside operational window
-      if (year < 2024 || year > 2027) return;
+            if (!monthMap[sortKey]) {
+              monthMap[sortKey] = { month: monthLabel, sortKey, inward: 0, outward: 0, totalAmount: 0 };
+            }
 
-      const sortKey = `${year}-${String(d.getMonth() + 1).padStart(2, "0")}`;
-      const monthLabel = d.toLocaleDateString("en-US", { month: "short", year: "2-digit" });
-
-      if (!monthMap[sortKey]) {
-        monthMap[sortKey] = { month: monthLabel, sortKey, inward: 0, outward: 0, totalAmount: 0 };
+            monthMap[sortKey].inward += 1;
+            const amt = Number(r.amount);
+            if (!isNaN(amt) && amt > 0) monthMap[sortKey].totalAmount += amt;
+          }
+        }
       }
 
-      monthMap[sortKey].inward += 1;
-      if (r.mark_to === "exited" || (r.outward_date && r.inward_date && r.outward_date !== r.inward_date)) {
-        monthMap[sortKey].outward += 1;
+      // 2. Outward counted on outward_date
+      const isOutward = Boolean(
+        (r.outward_date && r.outward_date.trim() !== "") ||
+        r.mark_to === "exited"
+      );
+      if (isOutward) {
+        const outDateStr = r.outward_date || r.inward_date || r.created_at;
+        if (outDateStr) {
+          const d = new Date(outDateStr);
+          if (!isNaN(d.getTime())) {
+            const year = d.getFullYear();
+            if (year >= 2024 && year <= 2027) {
+              const sortKey = `${year}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+              const monthLabel = d.toLocaleDateString("en-US", { month: "short", year: "2-digit" });
+
+              if (!monthMap[sortKey]) {
+                monthMap[sortKey] = { month: monthLabel, sortKey, inward: 0, outward: 0, totalAmount: 0 };
+              }
+
+              monthMap[sortKey].outward += 1;
+            }
+          }
+        }
       }
-      const amt = Number(r.amount);
-      if (!isNaN(amt) && amt > 0) monthMap[sortKey].totalAmount += amt;
     });
 
     const sorted = Object.values(monthMap).sort((a, b) => a.sortKey.localeCompare(b.sortKey));
@@ -390,23 +468,42 @@ export default function Dashboard() {
   }, [filteredRecords]);
 
   // Drilldown Modal
-  const handleOpenDrilldown = (type: "category" | "section", key: string, title: string) => {
-    const items = filteredRecords.filter(r => {
-      if (type === "category") {
-        let cat = (r.main_category || "others").trim().toLowerCase();
-        return title.toLowerCase().includes(cat) || cat.includes(key.toLowerCase());
-      } else {
-        let sec = (r.mark_to || "unassigned").trim().toLowerCase();
-        return title.toLowerCase().includes(sec) || sec.includes(key.toLowerCase());
-      }
-    });
-
+  const handleOpenDrilldown = async (type: "category" | "section", key: string, title: string) => {
+    setIsDrilldownLoading(true);
     setDrilldownModal({
       title,
       type,
       key,
-      items
+      items: []
     });
+
+    try {
+      let q = supabase
+        .from("file_tracking_records" as any)
+        .select("id, cfo_diary_number, receiving_number, inward_date, outward_date, main_category, mark_to, amount, subject, created_at")
+        .order("created_at", { ascending: false })
+        .limit(50);
+
+      const cleanKey = key.toLowerCase().split("/")[0].trim().replace(/ section| bills| claims| office/gi, "").trim();
+
+      if (type === "category") {
+        q = q.ilike("main_category", `%${cleanKey}%`);
+      } else {
+        q = q.ilike("mark_to", `%${cleanKey}%`);
+      }
+
+      const { data } = await q;
+      setDrilldownModal({
+        title,
+        type,
+        key,
+        items: data || []
+      });
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setIsDrilldownLoading(false);
+    }
   };
 
   // Animation variants
@@ -446,6 +543,10 @@ export default function Dashboard() {
                 </h1>
                 <span className="hidden sm:inline-flex items-center gap-1 text-[11px] font-bold px-2.5 py-0.5 rounded-full bg-blue-50 text-[#1e3a8a] border border-blue-200">
                   <Database className="w-3 h-3 text-[#1e3a8a]" /> Official Records
+                </span>
+                <span className="inline-flex items-center gap-1.5 text-[11px] font-bold px-2.5 py-0.5 rounded-full bg-emerald-50 text-emerald-800 border border-emerald-200">
+                  <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+                  Live Realtime
                 </span>
               </div>
               <p className="text-xs text-slate-700 font-semibold mt-0.5">
@@ -604,13 +705,13 @@ export default function Dashboard() {
                 </span>
               </div>
               <p className="mt-2 text-xs text-slate-700 font-semibold">
-                Files forwarded or exited to external departments
+                Official files dispatched and forwarded to departmental sections
               </p>
             </CardContent>
           </Card>
         </motion.div>
 
-        {/* ACTIVE IN SECTIONS (IN-TRANSIT) */}
+        {/* ACTIVE IN SECTIONS */}
         <motion.div variants={itemVariants}>
           <Card className="bg-white border-slate-200 shadow-sm hover:shadow-md transition-shadow rounded-2xl">
             <CardContent className="p-5">
@@ -624,14 +725,14 @@ export default function Dashboard() {
               </div>
               <div className="mt-3 flex items-baseline gap-2 flex-wrap">
                 <span className="text-2xl sm:text-3xl xl:text-4xl font-black text-amber-800 tracking-tight">
-                  {stats.inTransitCount.toLocaleString()}
+                  {stats.activeSectionsCount.toLocaleString()} Sections
                 </span>
                 <span className="text-[10px] sm:text-xs font-black text-amber-900 bg-amber-100 px-2 py-0.5 rounded-full border border-amber-300 whitespace-nowrap">
-                  In Progress
+                  {stats.pendingOutwardCount > 0 ? `${stats.pendingOutwardCount} Pending Outward` : "All Dispatched"}
                 </span>
               </div>
               <p className="mt-2 text-xs text-slate-700 font-semibold">
-                Files actively under review in internal trays & sections
+                Files distributed across {stats.activeSectionsCount} active operational departments
               </p>
             </CardContent>
           </Card>
@@ -1076,7 +1177,7 @@ export default function Dashboard() {
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
-              {filteredRecords.slice(0, 10).map((r) => (
+              {(recentFiles.length > 0 ? recentFiles : filteredRecords.slice(0, 10)).map((r) => (
                 <tr key={r.id || r.cfo_diary_number} className="hover:bg-slate-50 transition-colors">
                   <td className="py-3.5 px-4">
                     <span className="font-mono font-black text-[#1e3a8a] block">
@@ -1101,10 +1202,12 @@ export default function Dashboard() {
                     {r.inward_date || "---"}
                   </td>
                   <td className="py-3.5 px-3 font-mono font-bold">
-                    {r.mark_to === "exited" || (r.outward_date && r.inward_date && r.outward_date !== r.inward_date) ? (
+                    {r.outward_date && r.outward_date.trim() !== "" ? (
                       <span className="text-sky-800 font-black">{r.outward_date}</span>
+                    ) : r.mark_to === "exited" ? (
+                      <span className="text-emerald-800 font-black">Exited</span>
                     ) : (
-                      <span className="text-amber-800 font-bold text-[11px] bg-amber-50 px-2 py-0.5 rounded border border-amber-200">In Section</span>
+                      <span className="text-amber-800 font-bold text-[11px] bg-amber-50 px-2 py-0.5 rounded border border-amber-200">Pending Outward</span>
                     )}
                   </td>
                   <td className="py-3.5 px-4 text-right font-mono font-black">
@@ -1149,8 +1252,18 @@ export default function Dashboard() {
               </div>
             </div>
 
-            <div className="max-h-96 overflow-y-auto border border-slate-200 rounded-xl custom-scrollbar">
-              <table className="w-full text-left text-xs">
+            <div className="max-h-96 overflow-y-auto border border-slate-200 rounded-xl custom-scrollbar relative">
+              {isDrilldownLoading ? (
+                <div className="py-16 flex flex-col items-center justify-center gap-2 text-slate-500 font-bold text-xs">
+                  <RefreshCw className="w-5 h-5 animate-spin text-[#1e3a8a]" />
+                  <span>Loading records from database...</span>
+                </div>
+              ) : drilldownModal?.items.length === 0 ? (
+                <div className="py-16 text-center text-slate-500 font-bold text-xs">
+                  No records found.
+                </div>
+              ) : (
+                <table className="w-full text-left text-xs">
                 <thead className="bg-slate-100 text-slate-700 font-black uppercase sticky top-0 border-b border-slate-200 text-[10px]">
                   <tr>
                     <th className="py-2.5 px-3">Diary No</th>
@@ -1182,6 +1295,7 @@ export default function Dashboard() {
                   ))}
                 </tbody>
               </table>
+              )}
             </div>
           </div>
         </DialogContent>

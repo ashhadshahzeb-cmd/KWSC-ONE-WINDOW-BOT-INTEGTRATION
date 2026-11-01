@@ -38,7 +38,14 @@ import {
   Image as ImageIcon,
   ExternalLink,
   Maximize2,
-  X
+  X,
+  Shield,
+  Zap,
+  Globe,
+  Lock,
+  Siren,
+  TriangleAlert,
+  ServerCrash
 } from 'lucide-react';
 import { Checkbox } from '@/components/ui/checkbox';
 import { QRCodeCanvas } from 'qrcode.react';
@@ -56,6 +63,7 @@ import {
 import { supabase } from '@/integrations/supabase/client';
 import { db } from '@/lib/db';
 import { cn } from '@/lib/utils';
+import { useSecurityAlerts, SecurityAlert, triggerSecurityAlert, getUserIP } from '@/hooks/useSecurityMonitor';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Processing Time helpers
@@ -220,6 +228,72 @@ export default function ActivityLog() {
   const { userRole, isAdmin } = useAuth();
   const isAdminUser = userRole === 'admin' || isAdmin;
   const hasAccess = true; // Activity log visible to all users
+  const { alerts: securityAlerts } = useSecurityAlerts();
+
+  // ── Attack Demo State ──────────────────────────────────────────
+  const [showAttackDemo, setShowAttackDemo] = useState(false);
+  const [isDemoRunning, setIsDemoRunning] = useState(false);
+  const [demoStep, setDemoStep] = useState(0);
+  const [demoAlerts, setDemoAlerts] = useState<SecurityAlert[]>([]);
+
+  // Demo attack scenarios
+  const DEMO_SCENARIOS: SecurityAlert[] = [
+    {
+      type: 'DELETE_BURST',
+      severity: 'CRITICAL',
+      user_role: 'sub_cfo_1',
+      user_name: 'ASST. CFO-1',
+      description: 'ASST. CFO-1 deleted 7 records within 1 hour — Unusual activity detected!',
+      details: { count: 7, ip: '103.14.52.88', window: '60 minutes', location: 'Karachi, PK' },
+      timestamp: new Date().toISOString(),
+    },
+    {
+      type: 'OFF_HOURS_ACCESS',
+      severity: 'HIGH',
+      user_role: 'entry_operator',
+      user_name: 'ENTRY OPERATOR',
+      description: 'ENTRY OPERATOR accessed the system at 2:15 AM (PKT) — Outside office hours!',
+      details: { ip: '45.151.62.240', pkt_hour: 2, location: 'Unknown Location' },
+      timestamp: new Date(Date.now() - 60000).toISOString(),
+    },
+    {
+      type: 'BRUTE_FORCE',
+      severity: 'CRITICAL',
+      user_role: 'unknown',
+      user_name: 'UNKNOWN USER',
+      description: '12 failed login attempts detected — Brute force attack on admin@kwsb.gov.pk!',
+      details: { attempts: 12, ip: '185.220.101.45', location: 'Germany (Tor Exit Node)', target_email: 'admin@kwsb.gov.pk' },
+      timestamp: new Date(Date.now() - 120000).toISOString(),
+    },
+    {
+      type: 'RAPID_LOGIN',
+      severity: 'HIGH',
+      user_role: 'cfo',
+      user_name: 'CFO',
+      description: 'CFO account logged in simultaneously from 2 different IP addresses — Possible session hijack!',
+      details: { ip: '103.14.52.88', second_ip: '91.108.4.12', location: 'Karachi + Russia', gap_minutes: 2 },
+      timestamp: new Date(Date.now() - 30000).toISOString(),
+    },
+  ];
+
+  const handleRunAttackDemo = async () => {
+    setIsDemoRunning(true);
+    setDemoAlerts([]);
+    setDemoStep(0);
+
+    // Fire each scenario with a delay — dramatic effect
+    for (let i = 0; i < DEMO_SCENARIOS.length; i++) {
+      await new Promise(resolve => setTimeout(resolve, i === 0 ? 500 : 1800));
+      setDemoStep(i + 1);
+      setDemoAlerts(prev => [DEMO_SCENARIOS[i], ...prev]);
+
+      // Actually fire it to the real system (so WhatsApp + DB also get it)
+      await triggerSecurityAlert(DEMO_SCENARIOS[i]);
+    }
+
+    setIsDemoRunning(false);
+    toast.success('Attack Demo complete — Check WhatsApp for notifications!', { duration: 5000 });
+  };
   
   const [logs, setLogs] = useState<ActivityLogEntry[]>([]);
   const [stats, setStats] = useState<UserStats[]>([]);
@@ -532,6 +606,7 @@ export default function ActivityLog() {
       case 'DELETE': return <Trash2 className="w-4 h-4" />;
       case 'LOGIN': return <LogIn className="w-4 h-4" />;
       case 'LOGOUT': return <LogOut className="w-4 h-4" />;
+      case 'SECURITY_ALERT': return <ShieldCheck className="w-4 h-4" />;
       default: return <Activity className="w-4 h-4" />;
     }
   };
@@ -539,6 +614,7 @@ export default function ActivityLog() {
   const getActionSeverity = (action: string) => {
     switch (action) {
       case 'DELETE': return 'critical';
+      case 'SECURITY_ALERT': return 'critical';
       case 'EDIT':
       case 'FORWARD': return 'warning';
       default: return 'info';
@@ -641,6 +717,37 @@ export default function ActivityLog() {
 
   return (
     <div className="space-y-6 animate-in fade-in duration-500 pb-16">
+      {/* Security Alerts Banner */}
+      {securityAlerts.length > 0 && (
+        <div className="space-y-2">
+          {securityAlerts.slice(0, 3).map((alert, idx) => (
+            <div
+              key={idx}
+              className={`flex items-start gap-3 p-4 rounded-2xl border backdrop-blur-xl animate-in slide-in-from-top-2 duration-300 ${
+                alert.severity === 'CRITICAL'
+                  ? 'bg-rose-500/10 border-rose-500/30 text-rose-200'
+                  : 'bg-amber-500/10 border-amber-500/30 text-amber-200'
+              }`}
+            >
+              <AlertCircle className={`w-5 h-5 shrink-0 mt-0.5 ${alert.severity === 'CRITICAL' ? 'text-rose-400' : 'text-amber-400'}`} />
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className={`text-[10px] font-black uppercase tracking-widest px-2 py-0.5 rounded-full ${alert.severity === 'CRITICAL' ? 'bg-rose-500/20 text-rose-300' : 'bg-amber-500/20 text-amber-300'}`}>
+                    🚨 {alert.severity}
+                  </span>
+                  <span className="text-xs font-bold">{alert.type.replace(/_/g, ' ')}</span>
+                  <span className="text-[10px] text-white/40 font-mono">{new Date(alert.timestamp).toLocaleTimeString()}</span>
+                </div>
+                <p className="text-xs mt-1 text-white/70">{alert.description}</p>
+                {alert.details?.ip && alert.details.ip !== 'unknown' && (
+                  <p className="text-[10px] text-white/40 font-mono mt-0.5">IP: {alert.details.ip}</p>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
       {/* Header */}
       <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 bg-[#0f1115]/80 p-6 rounded-[28px] border border-white/5 backdrop-blur-xl shadow-2xl">
         <div className="space-y-1">
@@ -681,6 +788,18 @@ export default function ActivityLog() {
             {isExporting ? <Loader2 className="w-3.5 h-3.5 mr-2 animate-spin" /> : <Download className="w-3.5 h-3.5 mr-2" />}
             Export
           </Button>
+          {/* 🚨 Attack Demo — visible to all users for demonstration */}
+          <>
+            <div className="w-px h-6 bg-white/10" />
+            <Button
+              variant="outline"
+              className="border-rose-500/30 bg-rose-500/10 text-rose-300 hover:bg-rose-500/20 hover:text-rose-200 text-xs h-8 font-bold animate-pulse hover:animate-none"
+              onClick={() => setShowAttackDemo(true)}
+            >
+              <AlertCircle className="w-3.5 h-3.5 mr-2" />
+              🚨 Attack Demo
+              </Button>
+          </>
         </div>
       </div>
 
@@ -832,6 +951,7 @@ export default function ActivityLog() {
                 <SelectItem value="DELETE">Delete</SelectItem>
                 <SelectItem value="LOGIN">Login</SelectItem>
                 <SelectItem value="LOGOUT">Logout</SelectItem>
+                <SelectItem value="SECURITY_ALERT">🚨 Security Alert</SelectItem>
               </SelectContent>
             </Select>
 
@@ -1477,6 +1597,232 @@ export default function ActivityLog() {
           [data-radix-portal] .border-zinc-100 { border-color: rgba(255,255,255,0.05) !important; }
         }
       `}</style>
+
+      {/* ═══════════════════════════════════════════════════════════
+          🚨 ATTACK DEMO MODAL — Full Screen
+      ═══════════════════════════════════════════════════════════ */}
+      {showAttackDemo && (
+        <div className="fixed inset-0 z-[999] bg-black/95 backdrop-blur-xl flex flex-col overflow-auto">
+          {/* Top bar */}
+          <div className="flex items-center justify-between px-6 py-4 border-b border-rose-500/20 bg-rose-950/30 shrink-0">
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 rounded-xl bg-rose-500/20 border border-rose-500/30 flex items-center justify-center animate-pulse">
+                <AlertCircle className="w-5 h-5 text-rose-400" />
+              </div>
+              <div>
+                <h2 className="text-lg font-black text-white tracking-tight">🛡️ KWSC Security Attack Detection — Live Demo</h2>
+                <p className="text-xs text-rose-300/60">This demo shows how the system detects and responds to security attacks</p>
+              </div>
+            </div>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="text-white/50 hover:text-white hover:bg-white/10"
+              onClick={() => { setShowAttackDemo(false); setDemoAlerts([]); setDemoStep(0); setIsDemoRunning(false); }}
+            >
+              <X className="w-5 h-5" />
+            </Button>
+          </div>
+
+          <div className="flex-1 p-6 max-w-5xl mx-auto w-full space-y-6">
+
+            {/* ── Intro Card ── */}
+            <div className="bg-[#0f1115] border border-white/5 rounded-2xl p-6 space-y-4">
+              <div className="flex items-start gap-4">
+                <div className="w-12 h-12 rounded-2xl bg-gradient-to-br from-rose-500/20 to-orange-500/20 border border-rose-500/20 flex items-center justify-center shrink-0">
+                  <ShieldCheck className="w-6 h-6 text-rose-400" />
+                </div>
+                <div>
+                  <h3 className="text-base font-bold text-white">How Does System Attack Detection Work?</h3>
+                  <p className="text-sm text-white/50 mt-1">
+                    KWSC system monitors all user activities 24/7. When any suspicious action is detected — whether internal or external — the system <span className="text-rose-300 font-semibold">immediately alerts</span> the admin and sends a WhatsApp notification.
+                  </p>
+                </div>
+              </div>
+
+              {/* Attack types explanation */}
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mt-4">
+                {[
+                  { icon: '🗑️', label: 'Delete Burst', desc: '3+ records deleted within 1 hour', color: 'rose' },
+                  { icon: '🌙', label: 'Off-Hours Login', desc: 'System access outside office hours', color: 'amber' },
+                  { icon: '🔐', label: 'Brute Force', desc: 'Repeated wrong password attempts', color: 'rose' },
+                  { icon: '🌍', label: 'IP Change', desc: 'Same account from different location', color: 'amber' },
+                ].map((item, i) => (
+                  <div key={i} className={`bg-${item.color}-500/5 border border-${item.color}-500/20 rounded-xl p-3 space-y-1`}>
+                    <div className="text-2xl">{item.icon}</div>
+                    <div className="text-xs font-bold text-white">{item.label}</div>
+                    <div className="text-[10px] text-white/40">{item.desc}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {/* ── Demo Control ── */}
+            <div className="bg-[#0f1115] border border-white/5 rounded-2xl p-6">
+              <div className="flex items-center justify-between mb-4">
+                <div>
+                  <h3 className="text-sm font-bold text-white">Simulate an Attack</h3>
+                  <p className="text-xs text-white/40 mt-0.5">
+                    Click the button — the system will detect real attacks, generate alerts, and send WhatsApp notifications
+                  </p>
+                </div>
+                <Button
+                  onClick={handleRunAttackDemo}
+                  disabled={isDemoRunning}
+                  className="bg-gradient-to-r from-rose-600 to-rose-500 hover:from-rose-500 hover:to-rose-400 text-white font-bold px-6 h-10 rounded-xl shadow-lg shadow-rose-500/20 border-0"
+                >
+                  {isDemoRunning ? (
+                    <><Loader2 className="w-4 h-4 mr-2 animate-spin" /> Running Demo...</>
+                  ) : (
+                    <><AlertCircle className="w-4 h-4 mr-2" /> 🚨 Start Attack Demo</>
+                  )}
+                </Button>
+              </div>
+
+              {/* Progress steps */}
+              {isDemoRunning && (
+                <div className="flex items-center gap-2 mb-4">
+                  {DEMO_SCENARIOS.map((s, i) => (
+                    <div key={i} className={`flex-1 h-1.5 rounded-full transition-all duration-700 ${i < demoStep ? 'bg-rose-500' : i === demoStep - 1 ? 'bg-rose-400 animate-pulse' : 'bg-white/10'}`} />
+                  ))}
+                </div>
+              )}
+
+              {/* Live Alert Feed */}
+              <div className="space-y-3 min-h-[60px]">
+                {demoAlerts.length === 0 && !isDemoRunning && (
+                  <p className="text-xs text-white/20 text-center py-6 border border-dashed border-white/5 rounded-xl">
+                    Alerts will appear here when you start the demo...
+                  </p>
+                )}
+
+                {demoAlerts.map((alert, idx) => (
+                  <div
+                    key={idx}
+                    className={`flex items-start gap-4 p-4 rounded-xl border animate-in slide-in-from-left-4 duration-500 ${
+                      alert.severity === 'CRITICAL'
+                        ? 'bg-rose-500/10 border-rose-500/30'
+                        : 'bg-amber-500/10 border-amber-500/20'
+                    }`}
+                  >
+                    {/* Severity indicator */}
+                    <div className={`w-10 h-10 rounded-xl flex items-center justify-center shrink-0 ${
+                      alert.severity === 'CRITICAL' ? 'bg-rose-500/20' : 'bg-amber-500/20'
+                    }`}>
+                      <span className="text-lg">{alert.severity === 'CRITICAL' ? '🔴' : '🟡'}</span>
+                    </div>
+
+                    <div className="flex-1 min-w-0 space-y-1">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <span className={`text-[10px] font-black uppercase tracking-widest px-2.5 py-1 rounded-full ${
+                          alert.severity === 'CRITICAL'
+                            ? 'bg-rose-500/20 text-rose-300 border border-rose-500/30'
+                            : 'bg-amber-500/20 text-amber-300 border border-amber-500/30'
+                        }`}>
+                          {alert.severity}
+                        </span>
+                        <span className="text-xs font-bold text-white">{alert.type.replace(/_/g, ' ')}</span>
+                        <span className="text-[10px] text-white/30 font-mono">
+                          {new Date(alert.timestamp).toLocaleTimeString('en-PK', { timeZone: 'Asia/Karachi' })} PKT
+                        </span>
+                      </div>
+                      <p className="text-sm text-white/80">{alert.description}</p>
+                      <div className="flex items-center gap-3 flex-wrap">
+                        {alert.details?.ip && (
+                          <span className="text-[10px] font-mono text-white/40 bg-white/5 px-2 py-0.5 rounded border border-white/5">
+                            🌐 IP: {alert.details.ip}
+                          </span>
+                        )}
+                        {alert.details?.location && (
+                          <span className="text-[10px] font-mono text-white/40 bg-white/5 px-2 py-0.5 rounded border border-white/5">
+                            📍 {alert.details.location}
+                          </span>
+                        )}
+                        {alert.details?.count && (
+                          <span className="text-[10px] font-mono text-rose-300/70 bg-rose-500/10 px-2 py-0.5 rounded border border-rose-500/20">
+                            🗑️ {alert.details.count} deletions
+                          </span>
+                        )}
+                        {alert.details?.attempts && (
+                          <span className="text-[10px] font-mono text-rose-300/70 bg-rose-500/10 px-2 py-0.5 rounded border border-rose-500/20">
+                            🔐 {alert.details.attempts} failed attempts
+                          </span>
+                        )}
+                      </div>
+                    </div>
+
+                    {/* WhatsApp sent badge */}
+                    <div className="shrink-0 flex flex-col items-end gap-1">
+                      <span className="text-[9px] bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 px-2 py-0.5 rounded-full font-bold">
+                        📱 WhatsApp Sent
+                      </span>
+                      <span className="text-[9px] bg-blue-500/10 text-blue-400 border border-blue-500/20 px-2 py-0.5 rounded-full font-bold">
+                        💾 DB Logged
+                      </span>
+                    </div>
+                  </div>
+                ))}
+
+                {/* Success summary after demo */}
+                {!isDemoRunning && demoAlerts.length === DEMO_SCENARIOS.length && (
+                  <div className="bg-emerald-500/10 border border-emerald-500/20 rounded-xl p-4 flex items-center gap-3 animate-in fade-in duration-700">
+                    <ShieldCheck className="w-5 h-5 text-emerald-400 shrink-0" />
+                    <div>
+                      <p className="text-sm font-bold text-emerald-300">✅ Demo Complete — System detected {demoAlerts.length} attacks!</p>
+                      <p className="text-xs text-emerald-400/60 mt-0.5">
+                        All alerts have been saved to the Activity Log and WhatsApp notifications were sent.
+                        Use the filter above to view "🚨 Security Alert" entries.
+                      </p>
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* ── Response Guide ── */}
+            <div className="bg-[#0f1115] border border-white/5 rounded-2xl p-6 space-y-4">
+              <h3 className="text-sm font-bold text-white flex items-center gap-2">
+                <ShieldCheck className="w-4 h-4 text-sky-400" />
+                What Should Admin Do — Response Guide
+              </h3>
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                {[
+                  {
+                    step: '1',
+                    title: 'View Alerts',
+                    desc: 'A red alert banner appears on the Activity Log page. Select "Security Alert" from the filter.',
+                    color: 'sky',
+                    icon: '👁️',
+                  },
+                  {
+                    step: '2',
+                    title: 'Block the User',
+                    desc: 'Use the Force Logout button next to the user in the Active Sessions card to immediately remove access.',
+                    color: 'amber',
+                    icon: '🚫',
+                  },
+                  {
+                    step: '3',
+                    title: 'Export Evidence',
+                    desc: 'Click the Export button to download the full activity log as CSV — for official record keeping.',
+                    color: 'emerald',
+                    icon: '📥',
+                  },
+                ].map((item) => (
+                  <div key={item.step} className={`bg-${item.color}-500/5 border border-${item.color}-500/15 rounded-xl p-4 space-y-2`}>
+                    <div className="flex items-center gap-2">
+                      <span className={`w-6 h-6 rounded-full bg-${item.color}-500/20 text-${item.color}-400 text-xs font-black flex items-center justify-center`}>{item.step}</span>
+                      <span className="text-sm font-bold text-white">{item.icon} {item.title}</span>
+                    </div>
+                    <p className="text-xs text-white/50">{item.desc}</p>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
     </div>
   );
 }

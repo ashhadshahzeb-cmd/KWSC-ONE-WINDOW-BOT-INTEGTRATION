@@ -8,6 +8,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import http from 'http'; // Render Web Service Port Binding
+import { appendRecordToGoogleSheet } from './googleSheetsSync.js';
 
 dotenv.config();
 
@@ -248,6 +249,7 @@ client.on('ready', async () => {
     if (!isSubscribed) {
         isSubscribed = true;
         subscribeToDatabase();
+        subscribeToSecurityAlerts();
     }
 
     // Guard: only start cron jobs once
@@ -1048,6 +1050,76 @@ function formatDailyDigestMessage(summary, headerTitle = 'Daily Evening Digest')
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Security Alert WhatsApp Notifier
+// Supabase activity_log realtime subscribe karta hai SECURITY_ALERT actions ke liye
+// ─────────────────────────────────────────────────────────────────────────────
+function subscribeToSecurityAlerts() {
+    console.log('🛡️ Subscribing to Security Alerts channel...');
+
+    supabase
+        .channel('security_alerts_whatsapp')
+        .on(
+            'postgres_changes',
+            {
+                event: 'INSERT',
+                schema: 'public',
+                table: 'activity_log',
+                filter: "action=eq.SECURITY_ALERT"
+            },
+            async (payload) => {
+                try {
+                    const log = payload.new;
+                    const details = log.details || {};
+                    const severity = details.severity || 'HIGH';
+                    const alertType = details.alert_type || 'UNKNOWN';
+                    const description = details.description || log.subject || 'Security event detected';
+                    const ip = details.ip || 'unknown';
+                    const timestamp = getPktDateTimeFormatted(new Date(log.created_at));
+
+                    const severityEmoji = severity === 'CRITICAL' ? '🔴' : '🟡';
+                    
+                    const alertMsg =
+                        `${severityEmoji} *KWSC SECURITY ALERT*\n` +
+                        `━━━━━━━━━━━━━━━━━━━━\n` +
+                        `⚠️ *Alert Type:* ${alertType}\n` +
+                        `👤 *User:* ${log.user_name} (${log.user_role})\n` +
+                        `📋 *Details:* ${description}\n` +
+                        `🌐 *IP Address:* ${ip}\n` +
+                        `🕐 *Time (PKT):* ${timestamp}\n` +
+                        `━━━━━━━━━━━━━━━━━━━━\n` +
+                        `_🏛️ KWSC One Window Security Monitor_`;
+
+                    // Send to all active target numbers
+                    for (const phone of activeTargetNumbers) {
+                        try {
+                            const jid = phone.includes('@c.us') ? phone : `${phone}@c.us`;
+                            await client.sendMessage(jid, alertMsg);
+                            console.log(`🛡️ Security alert sent to ${phone}`);
+                        } catch (sendErr) {
+                            console.warn(`⚠️ Could not send security alert to ${phone}:`, sendErr.message);
+                        }
+                    }
+
+                    // Also log to activity_log
+                    await logWhatsAppEvent(
+                        'OUTGOING',
+                        activeTargetNumbers.join(','),
+                        'Security Monitor Bot',
+                        alertMsg.substring(0, 200),
+                        'WHATSAPP_BROADCAST'
+                    );
+
+                } catch (err) {
+                    console.error('❌ Error sending security alert via WhatsApp:', err);
+                }
+            }
+        )
+        .subscribe((status) => {
+            console.log(`🛡️ Security Alerts subscription status: ${status}`);
+        });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // 3. Automated Daily Cron Job (5:00 PM PKT)
 // ─────────────────────────────────────────────────────────────────────────────
 function startCronJobs() {
@@ -1130,6 +1202,12 @@ function subscribeToDatabase() {
         .channel('file-tracking-inserts')
         .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'file_tracking_records' }, async (payload) => {
             const f = payload.new;
+
+            // 📊 Auto-sync new file entry to Google Sheets (non-blocking)
+            appendRecordToGoogleSheet(f).catch(sheetErr => {
+                console.warn('⚠️ Google Sheets auto-sync error:', sheetErr.message);
+            });
+
             if (!isRecordEligibleForNotification(f)) {
                 console.log(`⏩ [Filter] Skipping insert alert for ${f.cfo_diary_number || f.receiving_number} (Section: "${f.mark_to}", Category: "${f.main_category}")`);
                 return;

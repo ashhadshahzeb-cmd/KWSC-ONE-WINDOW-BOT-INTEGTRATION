@@ -1,6 +1,7 @@
 import { useEffect, useRef, useCallback, useState } from 'react';
 import { db, SyncTask } from '@/lib/db';
 import { supabase } from '@/integrations/supabase/client';
+import { syncToGoogleSheetDirectly } from '@/lib/googleSheetsClient';
 
 export type SyncStatus = 'online' | 'offline' | 'syncing' | 'error';
 
@@ -76,6 +77,9 @@ export function useSyncManager() {
             .from('file_tracking_records' as any)
             .insert(payload);
           if (error) throw error;
+
+          // 📊 Direct Browser -> Google Sheets Sync (non-blocking, zero server needed)
+          syncToGoogleSheetDirectly(payload).catch(() => {});
 
         } else if (task.action === 'update') {
           const { id: _id, is_dirty, deleted_locally, additional_mark_to, department_number, fuel_station, file_image, ...payload } = payloadToUpload;

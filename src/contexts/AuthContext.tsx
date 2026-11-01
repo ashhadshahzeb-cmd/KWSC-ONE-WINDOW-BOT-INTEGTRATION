@@ -2,6 +2,7 @@ import React, { createContext, useContext, useEffect, useState } from 'react';
 import { supabase } from '@/integrations/supabase/client';
 import { Session, User } from '@supabase/supabase-js';
 import { logActivity } from '@/hooks/useActivityLog';
+import { getUserIP, checkOffHoursAccess } from '@/hooks/useSecurityMonitor';
 
 export interface DepartmentUser {
   id?: string;
@@ -264,11 +265,14 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
             setIsAdmin(false);
             setAllowOverrideDates(false);
             
-            logActivity({
-              userRole: 'hrms_employee',
-              userName: hrmsData.name,
-              action: 'LOGIN',
-              details: { email: trimEmail, method: 'hrms_fallback' },
+            getUserIP().then(ip => {
+              logActivity({
+                userRole: 'hrms_employee',
+                userName: hrmsData.name,
+                action: 'LOGIN',
+                details: { email: trimEmail, method: 'hrms_fallback', ip },
+              });
+              checkOffHoursAccess('hrms_employee', hrmsData.name, ip);
             });
             return { success: true, method: 'hrms' };
           }
@@ -293,11 +297,14 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           setIsAdmin(role === 'super_admin' || role === 'cfo' || role === 'admin');
           setAllowOverrideDates(role === 'super_admin' || role === 'cfo' || role === 'admin');
           
-          logActivity({
-            userRole: localUser.roleId,
-            userName: localUser.displayName,
-            action: 'LOGIN',
-            details: { email: trimEmail, method: 'hardcoded_fallback' },
+          getUserIP().then(ip => {
+            logActivity({
+              userRole: localUser.roleId,
+              userName: localUser.displayName,
+              action: 'LOGIN',
+              details: { email: trimEmail, method: 'hardcoded_fallback', ip },
+            });
+            checkOffHoursAccess(localUser.roleId, localUser.displayName, ip);
           });
           return { success: true, method: 'hardcoded' };
         }
@@ -318,11 +325,16 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         }
       }
 
-      logActivity({
-        userRole: data.user?.user_metadata?.role_id || 'unknown',
-        userName: data.user?.user_metadata?.display_name || trimEmail,
-        action: 'LOGIN',
-        details: { email: trimEmail, method: 'supabase' },
+      getUserIP().then(ip => {
+        const role = data.user?.user_metadata?.role_id || 'unknown';
+        const name = data.user?.user_metadata?.display_name || trimEmail;
+        logActivity({
+          userRole: role,
+          userName: name,
+          action: 'LOGIN',
+          details: { email: trimEmail, method: 'supabase', ip },
+        });
+        checkOffHoursAccess(role, name, ip);
       });
 
       return { success: true, method: 'supabase' };

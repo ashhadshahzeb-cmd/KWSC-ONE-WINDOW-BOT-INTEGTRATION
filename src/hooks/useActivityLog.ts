@@ -4,7 +4,7 @@ import { supabase } from '@/integrations/supabase/client';
 // Types
 // ─────────────────────────────────────────────────────────────────────────────
 
-export type ActivityAction = 'REGISTER' | 'EDIT' | 'FORWARD' | 'DELETE' | 'LOGIN' | 'LOGOUT';
+export type ActivityAction = 'REGISTER' | 'EDIT' | 'FORWARD' | 'DELETE' | 'LOGIN' | 'LOGOUT' | 'UPDATE' | 'SECURITY_ALERT';
 
 export interface ActivityLogEntry {
   id: string;

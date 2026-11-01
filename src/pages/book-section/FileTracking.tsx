@@ -69,6 +69,7 @@ import { Badge } from "@/components/ui/badge";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { useAppConfig, getSubCategoriesFor, sectionsToLegacy } from "@/hooks/useAppConfig";
 import { logActivity } from "@/hooks/useActivityLog";
+import { checkDeleteBurst } from "@/hooks/useSecurityMonitor";
 import { addToOfflineQueue, syncOrphanedDirtyRecords } from "@/lib/offlineSync";
 import JourneyMapModal from "@/components/JourneyMapModal";
 import FileReception from "@/components/FileReception";
@@ -160,8 +161,19 @@ export default function FileTracking() {
   const location = useLocation();
   const navigate = useNavigate();
   const printRef = useRef<HTMLDivElement>(null);
+  const tabsListContainerRef = useRef<HTMLDivElement>(null);
   const [activeTab, setActiveTab] = useState("register");
   const [isForwardingMode, setIsForwardingMode] = useState(false);
+
+  // Automatically ensure active tab is scrolled into view horizontally
+  useEffect(() => {
+    if (tabsListContainerRef.current) {
+      const activeEl = tabsListContainerRef.current.querySelector<HTMLElement>('[data-state="active"]');
+      if (activeEl) {
+        activeEl.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'center' });
+      }
+    }
+  }, [activeTab]);
 
   // Filters & Pagination
   const [sortOrder, setSortOrder] = useState<"desc" | "asc">("desc");
@@ -375,6 +387,12 @@ export default function FileTracking() {
           after: { ...deletedRecord, status: 'trashed' } 
         }
       });
+
+      // 🛡️ Security: Check for DELETE burst (3+ deletes/hour)
+      checkDeleteBurst(
+        currentRole || 'unknown',
+        userName || currentRole || 'Unknown'
+      );
 
       toast.success(isOnline ? "Record deleted successfully." : "Deleted locally. Will sync when online.");
       setIsDeleteModalOpen(false);
@@ -1234,16 +1252,17 @@ export default function FileTracking() {
         const inputSubject = formData.subject.trim();
         const dateToCheck = formData.inward_date;
         
-        // 1. Get local records for that date
-        let combinedRecords = await db.records.filter(r => r.inward_date === dateToCheck).toArray();
+        // 1. Get local records for that date (fast indexed lookup)
+        let combinedRecords = await db.records.where('inward_date').equals(dateToCheck).toArray();
 
-        // 2. Get online records for that date (if online)
+        // 2. Get online records for that date (only fetch id & subject, lightning fast)
         try {
           if (navigator.onLine) {
             const { data, error } = await supabase
               .from('file_tracking_records' as any)
-              .select('*')
-              .eq('inward_date', dateToCheck);
+              .select('id, subject, cfo_diary_number')
+              .eq('inward_date', dateToCheck)
+              .limit(100);
               
             if (!error && data) {
                // Merge avoiding duplicates
@@ -1351,6 +1370,8 @@ export default function FileTracking() {
           record_id: formData.receiving_number,
         });
 
+        const { file_image: _img1, signature_data: _sig1, ...safeOldRecord } = (oldRecord || {}) as any;
+        const { file_image: _img2, signature_data: _sig2, ...safeUpdateRecord } = updatePayload as any;
         logActivity({
           userRole: currentRole || 'unknown',
           userName: userName || sections.find(s => s.id === currentRole)?.name || currentRole || 'Unknown',
@@ -1360,8 +1381,8 @@ export default function FileTracking() {
           receivingNumber: formData.receiving_number,
           subject: formData.subject,
           details: { 
-            before: oldRecord,
-            after: { id: editingRecordId, ...updatePayload, file_image: fileImage || undefined }
+            before: safeOldRecord,
+            after: { id: editingRecordId, ...safeUpdateRecord }
           }
         });
 
@@ -1424,6 +1445,8 @@ export default function FileTracking() {
           record_id: formData.receiving_number,
         });
 
+        const { file_image: _imgF1, signature_data: _sigF1, ...safeExistRecord } = (existingRecord || {}) as any;
+        const { file_image: _imgF2, signature_data: _sigF2, ...safeFwdRecord } = updatePayload as any;
         logActivity({
           userRole: currentRole || 'unknown',
           userName: userName || sections.find(s => s.id === currentRole)?.name || currentRole || 'Unknown',
@@ -1433,8 +1456,8 @@ export default function FileTracking() {
           receivingNumber: formData.receiving_number,
           subject: formData.subject,
           details: { 
-            before: existingRecord,
-            after: { ...existingRecord, ...updatePayload, file_image: fileImage || undefined }
+            before: safeExistRecord,
+            after: { ...safeExistRecord, ...safeFwdRecord }
           }
         });
 
@@ -1529,6 +1552,7 @@ export default function FileTracking() {
 
         // Calculate how long the user took to fill the registration form
         const formFillDurationMs = Date.now() - formStartTimeRef.current;
+        const { file_image: _nImg, signature_data: _nSig, ...safeNewEntry } = newEntry as any;
         logActivity({
           userRole: currentRole || 'unknown',
           userName: userName || sections.find(s => s.id === currentRole)?.name || currentRole || 'Unknown',
@@ -1537,7 +1561,7 @@ export default function FileTracking() {
           diaryNumber: formData.cfo_diary_number,
           receivingNumber: formData.receiving_number,
           subject: formData.subject,
-          details: { ...newEntry, file_image: fileImage || undefined, form_fill_duration_ms: formFillDurationMs }
+          details: { ...safeNewEntry, form_fill_duration_ms: formFillDurationMs }
         });
 
         if (linkedPendingId) {
@@ -1669,7 +1693,9 @@ export default function FileTracking() {
 
       const index = focusableElements.indexOf(target);
       if (index > -1 && index < focusableElements.length - 1) {
-        (focusableElements[index + 1] as HTMLElement).focus();
+        const nextEl = focusableElements[index + 1] as HTMLElement;
+        nextEl.focus();
+        nextEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
       }
     }
   };
@@ -1898,9 +1924,9 @@ export default function FileTracking() {
       return mapped;
     };
 
-    // Load from IndexedDB immediately
+    // Load from IndexedDB immediately (limit to 100 recent/dirty records for sub-10ms render)
     try {
-      const localData = await db.records.filter(r => !r.deleted_locally).toArray();
+      const localData = await db.records.filter(r => !r.deleted_locally).limit(100).toArray();
       if (localData.length > 0) {
         const filteredLocal = applyLocalFilters(localData);
         setRecords(filteredLocal);
@@ -1915,9 +1941,12 @@ export default function FileTracking() {
       const from = page * DB_PAGE_SIZE;
       const to = from + DB_PAGE_SIZE - 1;
 
+      // Fast slim column selection for table rows (excludes heavy base64 signature_data & file_image)
+      const tableSelectColumns = 'id, tracking_id, cfo_diary_number, receiving_number, inward_date, outward_date, main_category, sub_category, subject, mark_to, amount, gross_amount, deduction, received_from, employee_number, voucher_code, vehicle_no, print_date, handover_person_name, file_purpose, budget_code, remarks, created_at, date_of_sign' + (activeTab === 'bulk_modified' || activeTab === 'timeline' ? ', history' : '');
+
       let query = supabase
         .from('file_tracking_records' as any)
-        .select('*', { count: 'exact' });
+        .select(tableSelectColumns, { count: 'exact' });
 
       // Remove status filtering from Supabase query since the column doesn't exist in Supabase.
       // Trashed files will be fetched but filtered out locally in UI, or we can filter by history.
@@ -2044,15 +2073,12 @@ export default function FileTracking() {
         .order('created_at', { ascending: sortOrder === 'asc' })
         .range(from, to);
 
+      // 2. Build the query to get all matching records for statistics & global selection (slim metadata, no heavy histories)
       let selectFields = 'id, amount, main_category, sub_category, mark_to, created_at';
-      if (
-        activeTab === 'bulk_modified' ||
-        ((activeTab === 'tray' || activeTab === 'timeline' || activeTab === 'returned_files') && !(currentRole === 'cfo' || currentRole?.startsWith('sub_cfo') || isAdmin))
-      ) {
+      if (activeTab === 'bulk_modified') {
         selectFields += ', history';
       }
 
-      // 2. Build the query to get all matching records for statistics & global selection
       let allQuery = supabase
         .from('file_tracking_records' as any)
         .select(selectFields);
@@ -2156,7 +2182,9 @@ export default function FileTracking() {
         allQuery = allQuery.or(`cfo_diary_number.ilike.${q},receiving_number.ilike.${q},subject.ilike.${q},received_from.ilike.${q},tracking_id.ilike.${q},handover_person_name.ilike.${q},employee_number.ilike.${q},voucher_code.ilike.${q},vehicle_no.ilike.${q},file_purpose.ilike.${q}`);
       }
 
-      const allQueryPromise = allQuery.order('created_at', { ascending: sortOrder === 'asc' });
+      const allQueryPromise = allQuery
+        .order('created_at', { ascending: sortOrder === 'asc' })
+        .limit(1000);
 
       // 3. Execute queries in parallel
       const [pagedResult, allResult] = await Promise.all([pagedQueryPromise, allQueryPromise]);
@@ -3024,13 +3052,14 @@ export default function FileTracking() {
       </div>
 
       <Tabs value={activeTab} onValueChange={handleTabChange} className="w-full">
-        <div className="flex flex-col gap-4 mb-6 border-b border-border/50 pb-4 animate-slide-down" style={{ animationDelay: '0.1s' }}>
-          <div className="w-full overflow-x-auto pb-2 no-scrollbar">
-            <TabsList className="flex w-max h-auto bg-white p-1 rounded-xl border border-slate-200 gap-1">
+        {/* Sticky Pinned Navigation Tabs Bar */}
+        <div className="sticky -top-4 md:-top-8 z-30 bg-[#f8fafc]/95 dark:bg-[#0f172a]/95 backdrop-blur-md pt-2 md:pt-3 pb-2.5 mb-4 border-b border-slate-200 dark:border-slate-800 shadow-xs -mx-4 md:-mx-8 px-4 md:px-8">
+          <div ref={tabsListContainerRef} className="w-full overflow-x-auto pb-1 no-scrollbar scroll-smooth">
+            <TabsList className="flex w-max h-auto bg-white dark:bg-slate-900 p-1.5 rounded-2xl border border-slate-200 dark:border-slate-800 gap-1.5 shadow-xs">
             {isFileViewer ? (
               <TabsTrigger
                 value="view_only"
-                className="flex items-center gap-2 px-5 py-2 rounded-lg data-[state=active]:bg-[#1e3a8a] data-[state=active]:text-white text-slate-600 hover:text-[#1e3a8a] hover:bg-slate-100 transition-colors font-bold text-xs"
+                className="flex items-center gap-2 px-5 py-2.5 rounded-xl data-[state=active]:bg-[#1e3a8a] data-[state=active]:text-white data-[state=active]:shadow-md text-slate-600 dark:text-slate-300 hover:text-[#1e3a8a] hover:bg-slate-100 dark:hover:bg-slate-800 transition-all font-bold text-xs"
               >
                 <FileSearch className="w-4 h-4" /> View Only
               </TabsTrigger>
@@ -3038,28 +3067,30 @@ export default function FileTracking() {
               <>
                 <TabsTrigger
                   value="reception"
-                  className="flex items-center gap-2 px-5 py-2 rounded-lg data-[state=active]:bg-[#1e3a8a] data-[state=active]:text-white text-slate-600 hover:text-[#1e3a8a] hover:bg-slate-100 transition-colors font-bold text-xs"
+                  className="flex items-center gap-2 px-5 py-2.5 rounded-xl data-[state=active]:bg-[#1e3a8a] data-[state=active]:text-white data-[state=active]:shadow-md text-slate-600 dark:text-slate-300 hover:text-[#1e3a8a] hover:bg-slate-100 dark:hover:bg-slate-800 transition-all font-bold text-xs"
                 >
                   <Inbox className="w-4 h-4" /> File Reception
                 </TabsTrigger>
 
                 <TabsTrigger
                   value="register"
-                  className="flex items-center gap-2 px-5 py-2 rounded-lg data-[state=active]:bg-[#1e3a8a] data-[state=active]:text-white text-slate-600 hover:text-[#1e3a8a] hover:bg-slate-100 transition-colors font-bold text-xs"
+                  className="flex items-center gap-2 px-5 py-2.5 rounded-xl data-[state=active]:bg-[#1e3a8a] data-[state=active]:text-white data-[state=active]:shadow-md text-slate-600 dark:text-slate-300 hover:text-[#1e3a8a] hover:bg-slate-100 dark:hover:bg-slate-800 transition-all font-bold text-xs"
                 >
                   <Plus className="w-4 h-4" /> Registration
+                  {isEditingMode && <span className="ml-1 px-1.5 py-0.5 rounded bg-amber-500 text-white text-[9px] font-black uppercase tracking-wider">Edit</span>}
+                  {isForwardingMode && <span className="ml-1 px-1.5 py-0.5 rounded bg-indigo-500 text-white text-[9px] font-black uppercase tracking-wider">Forward</span>}
                 </TabsTrigger>
 
                 <TabsTrigger
                   value="pending_scans"
-                  className="flex items-center gap-2 px-5 py-2 rounded-lg data-[state=active]:bg-[#1e3a8a] data-[state=active]:text-white text-slate-600 hover:text-[#1e3a8a] hover:bg-slate-100 transition-colors font-bold text-xs"
+                  className="flex items-center gap-2 px-5 py-2.5 rounded-xl data-[state=active]:bg-[#1e3a8a] data-[state=active]:text-white data-[state=active]:shadow-md text-slate-600 dark:text-slate-300 hover:text-[#1e3a8a] hover:bg-slate-100 dark:hover:bg-slate-800 transition-all font-bold text-xs"
                 >
                   <Clock className="w-4 h-4" /> Pending Scans
                 </TabsTrigger>
 
                 <TabsTrigger
                   value="tray"
-                  className="flex items-center gap-2 px-5 py-2 rounded-lg data-[state=active]:bg-[#1e3a8a] data-[state=active]:text-white text-slate-600 hover:text-[#1e3a8a] hover:bg-slate-100 transition-colors font-bold text-xs relative"
+                  className="flex items-center gap-2 px-5 py-2.5 rounded-xl data-[state=active]:bg-[#1e3a8a] data-[state=active]:text-white data-[state=active]:shadow-md text-slate-600 dark:text-slate-300 hover:text-[#1e3a8a] hover:bg-slate-100 dark:hover:bg-slate-800 transition-all font-bold text-xs relative"
                 >
                   <Inbox className="w-4 h-4" /> My Tray
                   {inboxCount > 0 && (
@@ -3071,105 +3102,108 @@ export default function FileTracking() {
 
                 <TabsTrigger
                   value="returned_files"
-                  className="flex items-center gap-2 px-5 py-2 rounded-lg data-[state=active]:bg-[#1e3a8a] data-[state=active]:text-white text-slate-600 hover:text-[#1e3a8a] hover:bg-slate-100 transition-colors font-bold text-xs relative"
+                  className="flex items-center gap-2 px-5 py-2.5 rounded-xl data-[state=active]:bg-[#1e3a8a] data-[state=active]:text-white data-[state=active]:shadow-md text-slate-600 dark:text-slate-300 hover:text-[#1e3a8a] hover:bg-slate-100 dark:hover:bg-slate-800 transition-all font-bold text-xs relative"
                 >
                   <RefreshCw className="w-4 h-4" /> Returned Files
                 </TabsTrigger>
 
                 <TabsTrigger
                   value="timeline"
-                  className="flex items-center gap-2 px-5 py-2 rounded-lg data-[state=active]:bg-[#1e3a8a] data-[state=active]:text-white text-slate-600 hover:text-[#1e3a8a] hover:bg-slate-100 transition-colors font-bold text-xs"
+                  className="flex items-center gap-2 px-5 py-2.5 rounded-xl data-[state=active]:bg-[#1e3a8a] data-[state=active]:text-white data-[state=active]:shadow-md text-slate-600 dark:text-slate-300 hover:text-[#1e3a8a] hover:bg-slate-100 dark:hover:bg-slate-800 transition-all font-bold text-xs"
                 >
                   <History className="w-4 h-4" /> Timeline
                 </TabsTrigger>
 
                 <TabsTrigger
                   value="reports"
-                  className="flex items-center gap-2 px-5 py-2 rounded-lg data-[state=active]:bg-[#1e3a8a] data-[state=active]:text-white text-slate-600 hover:text-[#1e3a8a] hover:bg-slate-100 transition-colors font-bold text-xs"
+                  className="flex items-center gap-2 px-5 py-2.5 rounded-xl data-[state=active]:bg-[#1e3a8a] data-[state=active]:text-white data-[state=active]:shadow-md text-slate-600 dark:text-slate-300 hover:text-[#1e3a8a] hover:bg-slate-100 dark:hover:bg-slate-800 transition-all font-bold text-xs"
                 >
                   <FileSearch className="w-4 h-4" /> Tracking Reports
                 </TabsTrigger>
 
                 <TabsTrigger
                   value="bulk_modified"
-                  className="flex items-center gap-2 px-5 py-2 rounded-lg data-[state=active]:bg-[#1e3a8a] data-[state=active]:text-white text-slate-600 hover:text-[#1e3a8a] hover:bg-slate-100 transition-colors font-bold text-xs"
+                  className="flex items-center gap-2 px-5 py-2.5 rounded-xl data-[state=active]:bg-[#1e3a8a] data-[state=active]:text-white data-[state=active]:shadow-md text-slate-600 dark:text-slate-300 hover:text-[#1e3a8a] hover:bg-slate-100 dark:hover:bg-slate-800 transition-all font-bold text-xs"
                 >
                   <CalendarDays className="w-4 h-4" /> Bulk Modified
                 </TabsTrigger>
 
                 <TabsTrigger
                   value="track"
-                  className="flex items-center gap-2 px-5 py-2 rounded-lg data-[state=active]:bg-[#1e3a8a] data-[state=active]:text-white text-slate-600 hover:text-[#1e3a8a] hover:bg-slate-100 transition-colors font-bold text-xs"
+                  className="flex items-center gap-2 px-5 py-2.5 rounded-xl data-[state=active]:bg-[#1e3a8a] data-[state=active]:text-white data-[state=active]:shadow-md text-slate-600 dark:text-slate-300 hover:text-[#1e3a8a] hover:bg-slate-100 dark:hover:bg-slate-800 transition-all font-bold text-xs"
                 >
                   <Search className="w-4 h-4" /> Search
                 </TabsTrigger>
               </>
             )}
-                {isCFORole && (
-                  <TabsTrigger
-                    value="cfo_all_files"
-                    className="flex items-center gap-2 px-5 py-2 rounded-lg data-[state=active]:bg-[#1e3a8a] data-[state=active]:text-white text-slate-600 hover:text-[#1e3a8a] hover:bg-slate-100 transition-colors font-bold text-xs"
-                  >
-                    <Building2 className="w-4 h-4" /> CFO Dashboard
-                  </TabsTrigger>
-                )}
-                {currentRole === 'super_admin' && (
-                  <TabsTrigger
-                    value="backdate_2026"
-                    className="flex items-center gap-2 px-5 py-2 rounded-lg data-[state=active]:bg-[#1e3a8a] data-[state=active]:text-white text-slate-600 hover:text-[#1e3a8a] hover:bg-slate-100 transition-colors font-bold text-xs"
-                  >
-                    <History className="w-4 h-4" /> Backdate (2026)
-                  </TabsTrigger>
-                )}
-                <TabsTrigger 
-                  value="contractor_bills" 
-                  className="flex items-center gap-2 px-5 py-2 rounded-lg data-[state=active]:bg-[#1e3a8a] data-[state=active]:text-white text-slate-600 hover:text-[#1e3a8a] hover:bg-slate-100 transition-colors font-bold text-xs"
-                >
-                  <Building2 className="w-4 h-4" /> Contractor Bills
-                </TabsTrigger>
-                {isAdmin && (
-                  <TabsTrigger
-                    value="trash_box"
-                    className="flex items-center gap-2 px-5 py-2 rounded-lg data-[state=active]:bg-rose-600 data-[state=active]:text-white text-slate-600 hover:text-rose-600 hover:bg-rose-50 transition-colors font-bold text-xs"
-                  >
-                    <Trash2 className="w-4 h-4" /> Trash Box
-                  </TabsTrigger>
-                )}
+            {isCFORole && (
+              <TabsTrigger
+                value="cfo_all_files"
+                className="flex items-center gap-2 px-5 py-2.5 rounded-xl data-[state=active]:bg-[#1e3a8a] data-[state=active]:text-white data-[state=active]:shadow-md text-slate-600 dark:text-slate-300 hover:text-[#1e3a8a] hover:bg-slate-100 dark:hover:bg-slate-800 transition-all font-bold text-xs"
+              >
+                <Building2 className="w-4 h-4" /> CFO Dashboard
+              </TabsTrigger>
+            )}
+            {currentRole === 'super_admin' && (
+              <TabsTrigger
+                value="backdate_2026"
+                className="flex items-center gap-2 px-5 py-2.5 rounded-xl data-[state=active]:bg-[#1e3a8a] data-[state=active]:text-white data-[state=active]:shadow-md text-slate-600 dark:text-slate-300 hover:text-[#1e3a8a] hover:bg-slate-100 dark:hover:bg-slate-800 transition-all font-bold text-xs"
+              >
+                <History className="w-4 h-4" /> Backdate (2026)
+              </TabsTrigger>
+            )}
+            <TabsTrigger 
+              value="contractor_bills" 
+              className="flex items-center gap-2 px-5 py-2.5 rounded-xl data-[state=active]:bg-[#1e3a8a] data-[state=active]:text-white data-[state=active]:shadow-md text-slate-600 dark:text-slate-300 hover:text-[#1e3a8a] hover:bg-slate-100 dark:hover:bg-slate-800 transition-all font-bold text-xs"
+            >
+              <Building2 className="w-4 h-4" /> Contractor Bills
+            </TabsTrigger>
+            {isAdmin && (
+              <TabsTrigger
+                value="trash_box"
+                className="flex items-center gap-2 px-5 py-2.5 rounded-xl data-[state=active]:bg-rose-600 data-[state=active]:text-white data-[state=active]:shadow-md text-slate-600 dark:text-slate-300 hover:text-rose-600 hover:bg-rose-50 dark:hover:bg-rose-950/30 transition-all font-bold text-xs"
+              >
+                <Trash2 className="w-4 h-4" /> Trash Box
+              </TabsTrigger>
+            )}
           </TabsList>
           </div>
+        </div>
 
-          {/* PRE-ENTRY MODAL */}
-          <Dialog open={isPreEntryModalOpen} onOpenChange={setIsPreEntryModalOpen}>
-            <DialogContent className="bg-[#0f1115] border-white/10 text-white">
-              <DialogHeader>
-                <DialogTitle className="text-white text-xl">New Entry Details</DialogTitle>
-                <DialogDescription className="text-white/40">File ki entry shuru karne se pehle ye details bharain.</DialogDescription>
-              </DialogHeader>
-              <div className="space-y-4 mt-4">
-                <div>
-                  <label className="text-xs font-bold text-white/70 uppercase">File Owner / Handover Person</label>
-                  <Input 
-                    placeholder="e.g., Ali Raza / Admin Dept" 
-                    className="bg-white/5 border-white/10 mt-1 text-white"
-                    value={preEntryForm.handover_person_name}
-                    onChange={(e) => setPreEntryForm(prev => ({ ...prev, handover_person_name: e.target.value }))}
-                  />
-                </div>
-                <div>
-                  <label className="text-xs font-bold text-white/70 uppercase">File Purpose / Description</label>
-                  <Input 
-                    placeholder="e.g., Payment Voucher for July" 
-                    className="bg-white/5 border-white/10 mt-1 text-white"
-                    value={preEntryForm.file_purpose}
-                    onChange={(e) => setPreEntryForm(prev => ({ ...prev, file_purpose: e.target.value }))}
-                  />
-                </div>
-                <Button className="w-full bg-[#14b8a6] hover:bg-teal-600 text-[#0f1115] font-bold mt-4" onClick={handlePreEntrySubmit}>
-                  Proceed to Registration
-                </Button>
+        {/* PRE-ENTRY MODAL */}
+        <Dialog open={isPreEntryModalOpen} onOpenChange={setIsPreEntryModalOpen}>
+          <DialogContent className="bg-[#0f1115] border-white/10 text-white">
+            <DialogHeader>
+              <DialogTitle className="text-white text-xl">New Entry Details</DialogTitle>
+              <DialogDescription className="text-white/40">File ki entry shuru karne se pehle ye details bharain.</DialogDescription>
+            </DialogHeader>
+            <div className="space-y-4 mt-4">
+              <div>
+                <label className="text-xs font-bold text-white/70 uppercase">File Owner / Handover Person</label>
+                <Input 
+                  placeholder="e.g., Ali Raza / Admin Dept" 
+                  className="bg-white/5 border-white/10 mt-1 text-white"
+                  value={preEntryForm.handover_person_name}
+                  onChange={(e) => setPreEntryForm(prev => ({ ...prev, handover_person_name: e.target.value }))}
+                />
               </div>
-            </DialogContent>
-          </Dialog>
+              <div>
+                <label className="text-xs font-bold text-white/70 uppercase">File Purpose / Description</label>
+                <Input 
+                  placeholder="e.g., Payment Voucher for July" 
+                  className="bg-white/5 border-white/10 mt-1 text-white"
+                  value={preEntryForm.file_purpose}
+                  onChange={(e) => setPreEntryForm(prev => ({ ...prev, file_purpose: e.target.value }))}
+                />
+              </div>
+              <Button className="w-full bg-[#14b8a6] hover:bg-teal-600 text-[#0f1115] font-bold mt-4" onClick={handlePreEntrySubmit}>
+                Proceed to Registration
+              </Button>
+            </div>
+          </DialogContent>
+        </Dialog>
+
+        <div className="flex flex-col gap-4 mb-6 border-b border-border/50 pb-4 animate-slide-down" style={{ animationDelay: '0.1s' }}>
 
           <div className="flex flex-wrap items-center gap-2">
             {/* Global Search for My Tray, Timeline, Reports */}
@@ -4779,7 +4813,14 @@ export default function FileTracking() {
                     <FileEdit className="w-6 h-6 text-primary" />
                   </div>
                   <div>
-                    <CardTitle className="text-xl font-bold">File Registration Form</CardTitle>
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <CardTitle className="text-xl font-bold">File Registration Form</CardTitle>
+                      <Badge className="bg-[#1e3a8a] text-white text-xs px-2.5 py-0.5 font-bold shadow-xs">
+                        Active Tab: Registration
+                      </Badge>
+                      {isEditingMode && <Badge className="bg-amber-500 text-white text-xs px-2 py-0.5 font-bold">Edit Mode</Badge>}
+                      {isForwardingMode && <Badge className="bg-indigo-500 text-white text-xs px-2 py-0.5 font-bold">Forwarding Mode</Badge>}
+                    </div>
                     <p className="text-sm text-muted-foreground">Register new inward files and track their forward movement</p>
                   </div>
                 </div>
@@ -4813,7 +4854,17 @@ export default function FileTracking() {
                 </Button>
               </div>
             </CardHeader>
-            <CardContent id="registration-form-container" onKeyDown={handleKeyDown} className="flex flex-col gap-6 pt-6 border-t border-border/50">
+            <CardContent
+              id="registration-form-container"
+              onKeyDown={handleKeyDown}
+              onFocusCapture={(e) => {
+                const target = e.target as HTMLElement;
+                if (target && typeof target.scrollIntoView === 'function') {
+                  target.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+                }
+              }}
+              className="flex flex-col gap-6 pt-6 border-t border-border/50"
+            >
               
               {!isEditingMode && !isForwardingMode && (
                 <div className="flex flex-col sm:flex-row items-start sm:items-center gap-3 p-4 rounded-xl bg-[#14b8a6]/10 border-2 border-[#14b8a6]/30 shadow-lg shadow-[#14b8a6]/5 w-full">
@@ -4827,7 +4878,7 @@ export default function FileTracking() {
                       value={pendingTrackingCode}
                       onChange={e => setPendingTrackingCode(e.target.value)}
                       onKeyDown={e => { if (e.key === 'Enter') handleLoadPendingRecord(); }}
-                      className="flex-1 h-11 text-sm bg-[#0a0a0b] border-[#14b8a6]/30 rounded-lg focus-visible:ring-[#14b8a6]/50 font-mono"
+                      className="flex-1 h-11 text-sm bg-white dark:bg-[#0a0a0b] text-slate-900 dark:text-slate-100 border-[#14b8a6]/40 rounded-lg focus-visible:ring-[#14b8a6]/50 font-mono font-semibold"
                     />
                     <Button
                       onClick={handleLoadPendingRecord}
@@ -4851,7 +4902,7 @@ export default function FileTracking() {
                       e.preventDefault();
                       fetchNextDiaryNumber();
                     }}
-                    className="h-5 px-2 py-0 text-[10px] text-sky-400 border border-sky-400/20 hover:bg-sky-400 hover:text-white transition-colors"
+                    className="h-5 px-2 py-0 text-[10px] text-sky-500 border border-sky-400/30 hover:bg-sky-500 hover:text-white transition-colors"
                     title="Regenerate Diary Number if it already exists"
                   >
                     <RefreshCw className="w-3 h-3 mr-1" /> Regenerate
@@ -4860,7 +4911,7 @@ export default function FileTracking() {
                 <Input
                   value={formData.cfo_diary_number}
                   onChange={e => setFormData({ ...formData, cfo_diary_number: e.target.value })}
-                  className="bg-muted/20 border-border/50 font-mono font-bold text-primary"
+                  className="bg-white dark:bg-slate-900 border-slate-300 dark:border-slate-700 font-mono font-bold text-slate-900 dark:text-slate-100 h-11"
                 />
               </div>
 
@@ -4870,30 +4921,30 @@ export default function FileTracking() {
                   type="date"
                   value={formData.inward_date}
                   onChange={e => setFormData({ ...formData, inward_date: e.target.value })}
-                  className="bg-muted/20 border-border/50"
+                  className="bg-white dark:bg-slate-900 border-slate-300 dark:border-slate-700 text-slate-900 dark:text-slate-100 font-semibold h-11"
                 />
               </div>
 
               {currentRole !== 'entry_operator' && (
                 <div className="space-y-2">
-                  <Label className="text-xs uppercase font-bold text-[#14b8a6]">File Owner / Handover Person {currentRole !== 'entry_operator' && <span className="text-red-500">*</span>}</Label>
+                  <Label className="text-xs uppercase font-bold text-teal-600 dark:text-[#14b8a6]">File Owner / Handover Person {currentRole !== 'entry_operator' && <span className="text-red-500">*</span>}</Label>
                   <Input
                     placeholder="Handover Person / Owner"
                     value={formData.handover_person_name || ""}
                     onChange={e => setFormData({ ...formData, handover_person_name: e.target.value })}
-                    className="bg-muted/20 border-border/50 border-[#14b8a6]/30 text-[#14b8a6]"
+                    className="bg-white dark:bg-slate-900 border-slate-300 dark:border-slate-700 text-slate-900 dark:text-slate-100 font-semibold h-11"
                   />
                 </div>
               )}
 
               {currentRole !== 'entry_operator' && (
                 <div className="space-y-2">
-                  <Label className="text-xs uppercase font-bold text-[#14b8a6]">File Purpose / Description {currentRole !== 'entry_operator' && <span className="text-red-500">*</span>}</Label>
+                  <Label className="text-xs uppercase font-bold text-teal-600 dark:text-[#14b8a6]">File Purpose / Description {currentRole !== 'entry_operator' && <span className="text-red-500">*</span>}</Label>
                   <Input
                     placeholder="File Purpose"
                     value={formData.file_purpose || ""}
                     onChange={e => setFormData({ ...formData, file_purpose: e.target.value })}
-                    className="bg-muted/20 border-border/50 border-[#14b8a6]/30 text-[#14b8a6]"
+                    className="bg-white dark:bg-slate-900 border-slate-300 dark:border-slate-700 text-slate-900 dark:text-slate-100 font-semibold h-11"
                   />
                 </div>
               )}
@@ -4903,11 +4954,11 @@ export default function FileTracking() {
                   <Label className="text-xs uppercase font-bold text-muted-foreground">Budget Code <span className="text-muted-foreground/50 text-[10px]">(Optional)</span></Label>
                   <div className="relative group">
                     <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
-                      <FileText className="h-4 w-4 text-amber-400" />
+                      <FileText className="h-4 w-4 text-amber-500" />
                     </div>
                     <Input
                       placeholder="e.g. BC-2024-001"
-                      className="pl-10 bg-background/50 border-white/10 text-white font-mono h-11 focus:border-amber-400 focus:ring-1 focus:ring-amber-400 transition-all rounded-xl"
+                      className="pl-10 bg-white dark:bg-slate-900 border-slate-300 dark:border-slate-700 text-slate-900 dark:text-slate-100 font-mono h-11 transition-all rounded-xl font-semibold"
                       value={formData.budget_code || ""}
                       onChange={e => setFormData({ ...formData, budget_code: e.target.value })}
                     />
@@ -4921,7 +4972,7 @@ export default function FileTracking() {
                   placeholder="Department or Section"
                   value={formData.received_from}
                   onChange={e => setFormData({ ...formData, received_from: e.target.value })}
-                  className="bg-muted/20 border-border/50"
+                  className="bg-white dark:bg-slate-900 border-slate-300 dark:border-slate-700 text-slate-900 dark:text-slate-100 font-semibold h-11"
                 />
               </div>
 
@@ -4931,7 +4982,7 @@ export default function FileTracking() {
                   placeholder="Enter Receiving Number"
                   value={formData.receiving_number}
                   onChange={e => setFormData({ ...formData, receiving_number: e.target.value })}
-                  className="bg-muted/20 border-border/50 font-mono border-primary/30"
+                  className="bg-white dark:bg-slate-900 border-slate-300 dark:border-slate-700 font-mono text-slate-900 dark:text-slate-100 font-semibold h-11"
                 />
               </div>
               {currentRole !== 'entry_operator' && (
@@ -4939,11 +4990,11 @@ export default function FileTracking() {
                   <Label className="text-xs uppercase font-bold text-muted-foreground">Department Number <span className="text-muted-foreground/50 text-[10px]">(Optional)</span></Label>
                   <div className="relative group">
                     <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
-                      <FileText className="h-4 w-4 text-[#14b8a6]" />
+                      <FileText className="h-4 w-4 text-teal-500" />
                     </div>
                     <Input
                       placeholder="e.g. DEPT-123"
-                      className="pl-10 bg-background/50 border-white/10 text-white font-mono h-11 focus:border-[#14b8a6] focus:ring-1 focus:ring-[#14b8a6] transition-all rounded-xl"
+                      className="pl-10 bg-white dark:bg-slate-900 border-slate-300 dark:border-slate-700 text-slate-900 dark:text-slate-100 font-mono h-11 transition-all rounded-xl font-semibold"
                       value={formData.department_number || ""}
                       onChange={e => setFormData({ ...formData, department_number: e.target.value })}
                     />
@@ -4957,7 +5008,7 @@ export default function FileTracking() {
                   value={formData.mainCategory}
                   onValueChange={v => setFormData({ ...formData, mainCategory: v, subCategory: "" })}
                 >
-                  <SelectTrigger className="bg-muted/20 border-border/50">
+                  <SelectTrigger className="bg-white dark:bg-slate-900 border-slate-300 dark:border-slate-700 text-slate-900 dark:text-slate-100 font-semibold h-11">
                     <SelectValue placeholder="Select Main Category" />
                   </SelectTrigger>
                   <SelectContent>
@@ -4973,7 +5024,7 @@ export default function FileTracking() {
                   <Label className="text-xs uppercase font-bold text-muted-foreground">Fuel Station</Label>
                   <div className="relative">
                     <Select value={formData.fuel_station || formData.subCategory} onValueChange={v => setFormData({ ...formData, fuel_station: v, subCategory: v })}>
-                      <SelectTrigger className="w-full bg-background/50 border-white/10 text-white h-11 focus:border-[#14b8a6] focus:ring-1 focus:ring-[#14b8a6] transition-all rounded-xl">
+                      <SelectTrigger className="w-full bg-white dark:bg-slate-900 border-slate-300 dark:border-slate-700 text-slate-900 dark:text-slate-100 h-11 transition-all rounded-xl font-semibold">
                         <SelectValue placeholder="Select fuel station" />
                       </SelectTrigger>
                       <SelectContent className="max-h-[250px]">
@@ -5015,7 +5066,7 @@ export default function FileTracking() {
                     onValueChange={v => setFormData({ ...formData, subCategory: v })}
                     disabled={!formData.mainCategory}
                   >
-                    <SelectTrigger className="bg-muted/20 border-border/50">
+                    <SelectTrigger className="bg-white dark:bg-slate-900 border-slate-300 dark:border-slate-700 text-slate-900 dark:text-slate-100 font-semibold h-11">
                       <SelectValue placeholder={formData.mainCategory ? "Select Sub Category" : "Select Main Category First"} />
                     </SelectTrigger>
                     <SelectContent>
@@ -5039,7 +5090,7 @@ export default function FileTracking() {
                       value={formData.employee_number}
                       onChange={e => handleEmployeeNumberChange(e.target.value)}
                       onFocus={() => { if (empSuggestions.length > 0) setShowEmpSuggestions(true); }}
-                      className="bg-sky-500/5 border-sky-500/30 font-bold focus-visible:ring-sky-500 pr-8 font-mono text-sm"
+                      className="bg-sky-50 dark:bg-sky-950/20 border-sky-300 dark:border-sky-500/30 text-sky-800 dark:text-sky-300 font-bold focus-visible:ring-sky-500 pr-8 font-mono text-sm h-11"
                     />
                     {isSearchingEmp && (
                       <div className="absolute right-2.5 top-2.5">
@@ -5194,7 +5245,7 @@ export default function FileTracking() {
                   placeholder="Purpose of file"
                   value={formData.subject}
                   onChange={e => setFormData({ ...formData, subject: e.target.value })}
-                  className="bg-muted/20 border-border/50"
+                  className="bg-white dark:bg-slate-900 border-slate-300 dark:border-slate-700 text-slate-900 dark:text-slate-100 font-semibold h-11"
                 />
               </div>
 
@@ -5211,7 +5262,7 @@ export default function FileTracking() {
                           const gross = Number(e.target.value);
                           setFormData({ ...formData, gross_amount: gross, amount: gross - (formData.deduction || 0) })
                         }}
-                        className="bg-muted/20 border-border/50 font-bold text-primary"
+                        className="bg-white dark:bg-slate-900 border-slate-300 dark:border-slate-700 text-slate-900 dark:text-slate-100 font-bold h-11"
                       />
                     </div>
                     <div className="space-y-2">
@@ -5224,7 +5275,7 @@ export default function FileTracking() {
                           const ded = Number(e.target.value);
                           setFormData({ ...formData, deduction: ded, amount: (formData.gross_amount || 0) - ded })
                         }}
-                        className="bg-muted/20 border-border/50 font-bold text-red-400"
+                        className="bg-white dark:bg-slate-900 border-red-200 dark:border-red-900 text-red-600 dark:text-red-400 font-bold h-11"
                       />
                     </div>
                   </div>
@@ -5234,7 +5285,7 @@ export default function FileTracking() {
                       type="number"
                       disabled
                       value={formData.amount}
-                      className="bg-muted/20 border-emerald-500/30 font-black text-emerald-400 opacity-90 cursor-not-allowed"
+                      className="bg-emerald-50 dark:bg-emerald-950/30 border-emerald-300 dark:border-emerald-800 font-black text-emerald-700 dark:text-emerald-400 opacity-90 cursor-not-allowed h-11"
                     />
                   </div>
                 </>
@@ -5248,7 +5299,7 @@ export default function FileTracking() {
                         checked={formData.no_amount || false}
                         onCheckedChange={(checked) => setFormData({ ...formData, no_amount: !!checked, amount: checked ? 0 : formData.amount })}
                       />
-                      <label htmlFor="no_amount_chk" className="text-[11px] font-semibold text-white/60 cursor-pointer select-none">No Amount</label>
+                      <label htmlFor="no_amount_chk" className="text-[11px] font-semibold text-slate-600 dark:text-white/60 cursor-pointer select-none">No Amount</label>
                     </div>
                   </div>
                   <Input
@@ -5257,7 +5308,7 @@ export default function FileTracking() {
                     value={formData.amount}
                     disabled={formData.no_amount || false}
                     onChange={e => setFormData({ ...formData, amount: Number(e.target.value) })}
-                    className="bg-muted/20 border-border/50 font-bold text-primary disabled:opacity-40 disabled:cursor-not-allowed"
+                    className="bg-white dark:bg-slate-900 border-slate-300 dark:border-slate-700 text-slate-900 dark:text-slate-100 font-bold h-11 disabled:opacity-40 disabled:cursor-not-allowed"
                   />
                 </div>
               )}
@@ -5377,17 +5428,17 @@ export default function FileTracking() {
                   type="date"
                   value={formData.date_of_sign}
                   onChange={e => setFormData({ ...formData, date_of_sign: e.target.value })}
-                  className="bg-muted/20 border-border/50 text-blue-500 font-bold"
+                  className="bg-white dark:bg-slate-900 border-slate-300 dark:border-slate-700 text-blue-600 dark:text-blue-400 font-bold h-11"
                 />
               </div>
 
               <div className="space-y-2">
                 <Label className="text-xs uppercase font-bold text-muted-foreground">Mark To (Forward) {currentRole !== 'entry_operator' && <span className="text-red-500">*</span>}</Label>
                 <Select value={formData.mark_to} onValueChange={v => setFormData({ ...formData, mark_to: v })}>
-                  <SelectTrigger className="bg-muted/20 border-border/50 border-primary/30">
+                  <SelectTrigger className="bg-white dark:bg-slate-900 border-slate-300 dark:border-slate-700 text-slate-900 dark:text-slate-100 font-semibold h-11">
                     <SelectValue placeholder="Target Section" />
                   </SelectTrigger>
-                  <SelectContent className="bg-zinc-900 border-primary/20 text-white">
+                  <SelectContent className="bg-white dark:bg-zinc-900 border-slate-200 dark:border-primary/20 text-slate-900 dark:text-white">
                     {sections.map(section => (
                       <SelectItem key={section.id} value={section.id} className="font-bold uppercase tracking-tight">
                         {section.name} {section.id === 'books' || section.id === 'establishment' ? '(NEW)' : ''}
@@ -5404,10 +5455,10 @@ export default function FileTracking() {
                     value={formData.additional_mark_to || ""}
                     onValueChange={v => setFormData({ ...formData, additional_mark_to: v })}
                   >
-                    <SelectTrigger className="bg-muted/20 border-border/50">
+                    <SelectTrigger className="bg-white dark:bg-slate-900 border-slate-300 dark:border-slate-700 text-slate-900 dark:text-slate-100 font-semibold h-11">
                       <SelectValue placeholder="Select additional department (optional)" />
                     </SelectTrigger>
-                    <SelectContent className="bg-zinc-900 border-primary/20 text-white">
+                    <SelectContent className="bg-white dark:bg-zinc-900 border-slate-200 dark:border-primary/20 text-slate-900 dark:text-white">
                       {sections.map(section => (
                         <SelectItem key={section.id} value={section.id} className="font-bold uppercase tracking-tight">
                           {section.name}
@@ -5424,14 +5475,14 @@ export default function FileTracking() {
                   type="date"
                   value={formData.outward_date}
                   onChange={e => setFormData({ ...formData, outward_date: e.target.value })}
-                  className="bg-muted/20 border-border/50"
+                  className="bg-white dark:bg-slate-900 border-slate-300 dark:border-slate-700 text-slate-900 dark:text-slate-100 font-semibold h-11"
                 />
               </div>
 
               {(isAdmin || allowOverrideDates) && (
                 <>
                   <div className="space-y-2">
-                    <Label className="text-xs uppercase font-bold text-amber-500 flex items-center gap-2">
+                    <Label className="text-xs uppercase font-bold text-amber-600 dark:text-amber-500 flex items-center gap-2">
                       <Calendar className="w-3 h-3" />
                       Registration Date
                       <span className="text-[9px] font-normal text-muted-foreground normal-case">(Backward date allowed)</span>
@@ -5440,12 +5491,12 @@ export default function FileTracking() {
                       type="date"
                       value={formData.registration_date}
                       onChange={e => setFormData({ ...formData, registration_date: e.target.value, print_date: e.target.value })}
-                      className="bg-amber-500/5 border-amber-500/30 text-amber-500 font-bold focus-visible:ring-amber-500"
+                      className="bg-amber-50 dark:bg-amber-950/20 border-amber-300 dark:border-amber-500/30 text-amber-700 dark:text-amber-500 font-bold h-11 focus-visible:ring-amber-500"
                     />
                   </div>
 
                   <div className="space-y-2">
-                    <Label className="text-xs uppercase font-bold text-emerald-500 flex items-center gap-2">
+                    <Label className="text-xs uppercase font-bold text-emerald-600 dark:text-emerald-500 flex items-center gap-2">
                       <Printer className="w-3 h-3" />
                       Print Date
                       <span className="text-[9px] font-normal text-muted-foreground normal-case">(Shown on print slip)</span>
@@ -5454,7 +5505,7 @@ export default function FileTracking() {
                       type="date"
                       value={formData.print_date}
                       onChange={e => setFormData({ ...formData, print_date: e.target.value })}
-                      className="bg-emerald-500/5 border-emerald-500/30 text-emerald-500 font-bold focus-visible:ring-emerald-500"
+                      className="bg-emerald-50 dark:bg-emerald-950/20 border-emerald-300 dark:border-emerald-500/30 text-emerald-700 dark:text-emerald-500 font-bold h-11 focus-visible:ring-emerald-500"
                     />
                   </div>
                 </>
@@ -5466,7 +5517,7 @@ export default function FileTracking() {
                   placeholder="Any additional notes..."
                   value={formData.remarks}
                   onChange={e => setFormData({ ...formData, remarks: e.target.value })}
-                  className="bg-muted/20 border-border/50"
+                  className="bg-white dark:bg-slate-900 border-slate-300 dark:border-slate-700 text-slate-900 dark:text-slate-100 font-semibold h-11"
                 />
               </div>
 

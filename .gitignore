@@ -42,3 +42,8 @@ whatsapp-service/.wwebjs_auth/
 whatsapp-service/.wwebjs_cache/
 *.cjs
 !scripts/*.cjs
+
+# Google Service Account keys
+*google-service-account.json
+service-account.json
+whatsapp-service/google-service-account.json

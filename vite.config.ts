@@ -21,4 +21,27 @@ export default defineConfig(({ mode }) => ({
       "@": path.resolve(__dirname, "./src"),
     },
   },
+  build: {
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (id.includes('@zegocloud')) {
+            return 'vendor-zego';
+          }
+          if (id.includes('rrweb')) {
+            return 'vendor-rrweb';
+          }
+          if (id.includes('three')) {
+            return 'vendor-three';
+          }
+          if (id.includes('recharts')) {
+            return 'vendor-charts';
+          }
+          if (id.includes('node_modules')) {
+            return 'vendor-core';
+          }
+        }
+      }
+    }
+  }
 }));

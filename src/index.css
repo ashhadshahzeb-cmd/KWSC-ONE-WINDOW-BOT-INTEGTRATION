@@ -1372,3 +1372,101 @@ input[type="date"]:hover::-webkit-calendar-picker-indicator {
   margin: 0;
   size: A5 portrait;
 }
+
+/* ==========================================================================
+   ACTIVE ENTRY FIELD HIGHLIGHTING (FILE REGISTRATION FORM)
+   ========================================================================== */
+#registration-form-container input,
+#registration-form-container select,
+#registration-form-container textarea,
+#registration-form-container button[role="combobox"] {
+  scroll-margin-top: 130px;
+  scroll-margin-bottom: 90px;
+  transition: border-color 0.18s ease, box-shadow 0.18s ease, background-color 0.18s ease;
+}
+
+/* Light mode: strong visible borders on all form fields */
+:root:not(.dark) #registration-form-container input:not([type="checkbox"]):not([type="radio"]):not([disabled]),
+:root:not(.dark) #registration-form-container button[role="combobox"]:not([disabled]),
+:root:not(.dark) #registration-form-container textarea:not([disabled]) {
+  background-color: #ffffff !important;
+  border: 1.5px solid #94a3b8 !important;
+  color: #0f172a !important;
+  font-size: 0.875rem;
+  font-weight: 600;
+  min-height: 2.6rem;
+}
+
+:root:not(.dark) #registration-form-container input::placeholder,
+:root:not(.dark) #registration-form-container textarea::placeholder {
+  color: #94a3b8 !important;
+  font-weight: 400;
+}
+
+/* Dark mode: visible borders */
+.dark #registration-form-container input:not([type="checkbox"]):not([type="radio"]):not([disabled]),
+.dark #registration-form-container button[role="combobox"]:not([disabled]),
+.dark #registration-form-container textarea:not([disabled]) {
+  background-color: #1e293b !important;
+  border: 1.5px solid #475569 !important;
+  color: #f1f5f9 !important;
+  font-size: 0.875rem;
+  font-weight: 600;
+  min-height: 2.6rem;
+}
+
+/* Active / Focused Entry Field — Light mode */
+:root:not(.dark) #registration-form-container input:focus,
+:root:not(.dark) #registration-form-container input:focus-visible,
+:root:not(.dark) #registration-form-container textarea:focus,
+:root:not(.dark) #registration-form-container textarea:focus-visible,
+:root:not(.dark) #registration-form-container button[role="combobox"]:focus,
+:root:not(.dark) #registration-form-container button[role="combobox"][data-state="open"] {
+  outline: none !important;
+  border-color: #1e3a8a !important;
+  border-width: 2px !important;
+  box-shadow: 0 0 0 4px rgba(30, 58, 138, 0.15), 0 2px 8px rgba(30, 58, 138, 0.1) !important;
+  background-color: #f0f4ff !important;
+  color: #0f172a !important;
+}
+
+/* Active / Focused Entry Field — Dark mode */
+.dark #registration-form-container input:focus,
+.dark #registration-form-container input:focus-visible,
+.dark #registration-form-container textarea:focus,
+.dark #registration-form-container textarea:focus-visible,
+.dark #registration-form-container button[role="combobox"]:focus,
+.dark #registration-form-container button[role="combobox"][data-state="open"] {
+  outline: none !important;
+  border-color: #38bdf8 !important;
+  border-width: 2px !important;
+  box-shadow: 0 0 0 4px rgba(56, 189, 248, 0.2), 0 2px 8px rgba(56, 189, 248, 0.12) !important;
+  background-color: #0f1d2e !important;
+  color: #f8fafc !important;
+}
+
+/* Disabled fields — lighter in light mode */
+:root:not(.dark) #registration-form-container input[disabled],
+:root:not(.dark) #registration-form-container button[role="combobox"][disabled] {
+  background-color: #f1f5f9 !important;
+  border-color: #e2e8f0 !important;
+  color: #94a3b8 !important;
+  cursor: not-allowed;
+}
+
+/* Active Label Indicator for the field being typed in */
+#registration-form-container .space-y-2:focus-within > label {
+  color: #1e3a8a !important;
+  font-weight: 900 !important;
+  letter-spacing: 0.05em;
+  transition: all 0.15s ease;
+}
+
+.dark #registration-form-container .space-y-2:focus-within > label {
+  color: #38bdf8 !important;
+}
+
+/* Card container in the registration form — always white in light mode */
+:root:not(.dark) #registration-form-container {
+  background-color: #ffffff;
+}
